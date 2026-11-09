@@ -1,0 +1,29 @@
+{
+    "trained_at": "2026-09-10 23:45:19",
+    "model_type": "RandomForestRegressor",
+    "response_score_scale": "0-100",
+    "response_score_definition": "40% comfort + 50% low tinnitus noticeability + 10% willingness to listen again",
+    "deployment_training_method": "All available trials",
+    "deployment_samples": 11,
+    "deployment_patients": 3,
+    "total_samples": 11,
+    "patients": 3,
+    "sessions": 2,
+    "session_linked_trials": 4,
+    "legacy_trials": 7,
+    "validation_method": "Patient-wise GroupShuffleSplit",
+    "training_samples": 5,
+    "testing_samples": 6,
+    "training_patients": 2,
+    "testing_patients": 1,
+    "training_patient_ids": [
+        3,
+        4
+    ],
+    "testing_patient_ids": [
+        1
+    ],
+    "mae": 9.485777777777786,
+    "rmse": 13.559825549699072,
+    "r2": -0.9583666514135454
+}
