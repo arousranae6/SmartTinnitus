@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from database import get_connection
+from backend.db import get_connection
 from ml_model import (
     MODEL_FILE,
     load_model,
