@@ -11,3 +11,8 @@ __pycache__/
 
 smarttinnitus.db
 *.log
+*.sqlite
+*.sqlite3
+*.pdf
+*.joblib
+*.pkl

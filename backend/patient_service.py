@@ -1,38 +1,42 @@
-"""Patient-facing backend queries.
+"""Patient service layer for SmartTinnitus.
 
-This is intentionally UI-agnostic. Streamlit pages consume dictionaries from
-this service rather than owning new SQL. It currently uses the project's
-existing database.get_connection() adapter, so the rest of the application
-continues to work unchanged while the backend is migrated incrementally.
+The Streamlit UI should use this module for patient-directory operations instead
+of issuing patient SQL directly. SQLite remains the storage engine for now; the
+service boundary makes a later PostgreSQL/MySQL migration much easier.
 """
+
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+import sqlite3
 
-from database import get_connection
+from backend.db import get_connection
+from patient_access import create_patient_login
 
 
-def _table_exists(conn, name: str) -> bool:
+def _table_exists(conn, table_name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-        (name,),
+        (table_name,),
     ).fetchone()
     return row is not None
 
 
 def list_patients() -> list[dict[str, Any]]:
+    """Return all registered patients in a stable UI-friendly structure."""
     conn = get_connection()
     try:
         rows = conn.execute(
             """
             SELECT id, patient_code, age, sex, created_at
             FROM patients
-            ORDER BY patient_code COLLATE NOCASE
+            ORDER BY patient_code COLLATE NOCASE ASC, id ASC
             """
         ).fetchall()
         return [
             {
-                "id": row[0],
+                "id": int(row[0]),
                 "patient_code": row[1],
                 "age": row[2],
                 "sex": row[3],
@@ -51,15 +55,15 @@ def get_patient(patient_id: int) -> dict[str, Any] | None:
             """
             SELECT id, patient_code, age, sex, created_at
             FROM patients
-            WHERE id=?
+            WHERE id = ?
             LIMIT 1
             """,
-            (patient_id,),
+            (int(patient_id),),
         ).fetchone()
         if row is None:
             return None
         return {
-            "id": row[0],
+            "id": int(row[0]),
             "patient_code": row[1],
             "age": row[2],
             "sex": row[3],
@@ -70,134 +74,158 @@ def get_patient(patient_id: int) -> dict[str, Any] | None:
 
 
 def get_patient_id_by_code(patient_code: str) -> int | None:
+    code = str(patient_code or "").strip()
+    if not code:
+        return None
+
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id FROM patients WHERE patient_code=? LIMIT 1",
-            (patient_code,),
+            """
+            SELECT id
+            FROM patients
+            WHERE patient_code = ?
+            LIMIT 1
+            """,
+            (code,),
         ).fetchone()
-        return row[0] if row else None
+        return int(row[0]) if row is not None else None
     finally:
         conn.close()
 
 
-def _latest_review_status(conn, patient_id: int, pathway: str) -> str:
-    if not _table_exists(conn, "personalization_reviews"):
-        return "—"
+def _assessment_status(conn, patient_id: int) -> str:
+    if not _table_exists(conn, "tinnitus_profiles"):
+        return "Not started"
+
     row = conn.execute(
-        """
-        SELECT status
-        FROM personalization_reviews
-        WHERE patient_id=? AND pathway=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (patient_id, pathway),
+        "SELECT COUNT(*) FROM tinnitus_profiles WHERE patient_id = ?",
+        (int(patient_id),),
     ).fetchone()
-    return row[0] if row and row[0] else "—"
+    return "Available" if row and int(row[0] or 0) > 0 else "Not started"
 
 
-def get_patient_summary(patient_id: int) -> dict[str, Any] | None:
-    """Return the compact patient record used by professional workspaces."""
+def _audiogram_available(conn, patient_id: int) -> bool:
+    if not _table_exists(conn, "audiograms"):
+        return False
+
+    row = conn.execute(
+        "SELECT COUNT(*) FROM audiograms WHERE patient_id = ?",
+        (int(patient_id),),
+    ).fetchone()
+    return bool(row and int(row[0] or 0) > 0)
+
+
+def list_patient_summaries() -> list[dict[str, Any]]:
+    """Return compact patient-directory cards used by the Patients page."""
     conn = get_connection()
     try:
-        patient = conn.execute(
-            "SELECT id, patient_code, age, sex, created_at FROM patients WHERE id=?",
-            (patient_id,),
-        ).fetchone()
-        if patient is None:
-            return None
-
-        profile = conn.execute(
+        rows = conn.execute(
             """
-            SELECT estimated_pitch_hz, loudness_relative, created_at
-            FROM tinnitus_profiles
-            WHERE patient_id=?
-            ORDER BY id DESC LIMIT 1
-            """,
-            (patient_id,),
-        ).fetchone()
-        if profile is None:
-            assessment_status = "Not started"
-        elif profile[0] is not None and profile[1] is not None:
-            assessment_status = "Complete"
-        else:
-            assessment_status = "Incomplete"
-
-        audiogram = conn.execute(
+            SELECT id, patient_code, age, sex, created_at
+            FROM patients
+            ORDER BY patient_code COLLATE NOCASE ASC, id ASC
             """
-            SELECT COUNT(*), MAX(created_at)
-            FROM audiograms
-            WHERE patient_id=?
-            """,
-            (patient_id,),
-        ).fetchone() if _table_exists(conn, "audiograms") else (0, None)
-        audiogram_available = bool(audiogram and int(audiogram[0] or 0) > 0)
+        ).fetchall()
 
-        followup = conn.execute(
+        summaries: list[dict[str, Any]] = []
+        for row in rows:
+            patient_id = int(row[0])
+            summaries.append(
+                {
+                    "id": patient_id,
+                    "patient_code": row[1],
+                    "age": row[2],
+                    "sex": row[3],
+                    "created_at": row[4],
+                    "assessment_status": _assessment_status(conn, patient_id),
+                    "audiogram_available": _audiogram_available(conn, patient_id),
+                }
+            )
+        return summaries
+    finally:
+        conn.close()
+
+
+def create_patient_with_login(
+    patient_code: str,
+    age: int | None,
+    sex: str,
+) -> dict[str, Any]:
+    """Create a patient and its patient login as one application-level operation.
+
+    If account creation fails, the patient row is rolled back/deleted so the UI
+    cannot leave behind an unusable patient record.
+    """
+    code = str(patient_code or "").strip()
+    sex_value = str(sex or "").strip()
+
+    if not code:
+        return {"success": False, "message": "Enter a Patient ID."}
+    if not sex_value or sex_value == "Select":
+        return {"success": False, "message": "Select sex."}
+
+    conn = get_connection()
+    patient_id: int | None = None
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
-            SELECT session_date
-            FROM sessions
-            WHERE patient_id=?
-            ORDER BY session_date DESC, id DESC LIMIT 1
+            INSERT INTO patients (patient_code, age, sex, created_at)
+            VALUES (?, ?, ?, ?)
             """,
-            (patient_id,),
-        ).fetchone()
+            (
+                code,
+                int(age) if age is not None else None,
+                sex_value,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        patient_id = int(cursor.lastrowid)
+        conn.commit()
 
-        account = conn.execute(
-            """
-            SELECT username, is_active
-            FROM users
-            WHERE patient_id=? AND role='patient'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (patient_id,),
-        ).fetchone()
-
-        open_care = 0
-        action_required = 0
-        if _table_exists(conn, "care_requests"):
-            open_care = conn.execute(
-                """
-                SELECT COUNT(*) FROM care_requests
-                WHERE patient_id=? AND status NOT IN ('Completed','Cancelled')
-                """,
-                (patient_id,),
-            ).fetchone()[0]
-            action_required = conn.execute(
-                """
-                SELECT COUNT(*) FROM care_requests
-                WHERE patient_id=?
-                  AND direction='audiologist_to_patient'
-                  AND status IN ('Pending','Needs Information','Needs Confirmation','Referred')
-                """,
-                (patient_id,),
-            ).fetchone()[0]
-
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"success": False, "message": "Patient ID already exists."}
+    except Exception as exc:
+        conn.rollback()
         return {
-            "id": patient[0],
-            "patient_code": patient[1],
-            "age": patient[2],
-            "sex": patient[3],
-            "created_at": patient[4],
-            "account_username": account[0] if account else None,
-            "account_active": bool(account and account[1]),
-            "assessment_status": assessment_status,
-            "audiogram_available": audiogram_available,
-            "latest_audiogram": str(audiogram[1])[:10] if audiogram_available and audiogram[1] else None,
-            "manual_status": _latest_review_status(conn, patient_id, "standard"),
-            "ai_status": _latest_review_status(conn, patient_id, "ai"),
-            "last_followup": followup[0] if followup else None,
-            "open_care": int(open_care or 0),
-            "action_required": int(action_required or 0),
+            "success": False,
+            "message": f"The patient could not be created: {exc}",
         }
     finally:
         conn.close()
 
+    try:
+        success, message, username, password = create_patient_login(
+            patient_id=patient_id,
+            patient_code=code,
+        )
+    except Exception as exc:
+        success = False
+        message = str(exc)
+        username = None
+        password = None
 
-def list_patient_summaries() -> list[dict[str, Any]]:
-    return [
-        summary
-        for patient in list_patients()
-        if (summary := get_patient_summary(patient["id"])) is not None
-    ]
+    if not success:
+        cleanup_conn = get_connection()
+        try:
+            cleanup_conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+            cleanup_conn.commit()
+        finally:
+            cleanup_conn.close()
+
+        return {
+            "success": False,
+            "message": message or "The patient account could not be created.",
+        }
+
+    return {
+        "success": True,
+        "message": "Patient and login account created successfully.",
+        "patient_id": patient_id,
+        "patient_code": code,
+        "username": username,
+        "password": password,
+    }

@@ -1,0 +1,2 @@
+# Install these only when you are ready to run the PostgreSQL migration.
+psycopg[binary]>=3.2,<4
