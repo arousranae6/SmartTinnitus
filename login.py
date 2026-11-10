@@ -6,7 +6,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from database import get_connection
+from backend.db import get_connection
 
 
 PBKDF2_ITERATIONS = 310_000
